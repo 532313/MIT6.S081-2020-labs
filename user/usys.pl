@@ -36,3 +36,6 @@ entry("getpid");
 entry("sbrk");
 entry("sleep");
 entry("uptime");
+# 在user/usys.pl中添加
+entry("mmap");
+entry("munmap");
