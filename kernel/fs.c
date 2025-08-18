@@ -400,7 +400,65 @@ bmap(struct inode *ip, uint bn)
     brelse(bp);
     return addr;
   }
+  // 1. 调整逻辑块号：减去一级间接块处理的数量，转换为「二级间接块范围的偏移量」
+  // （此时bn从0开始，对应二级间接块需处理的逻辑块）
+  bn -= NINDIRECT;
 
+  // 2. 处理二级间接块：调整后的bn在二级间接块范围内（bn < 256*256=65536，NDINDIRECT=65536）
+  if (bn < NDINDIRECT)
+  {
+      // 计算二级间接块中的索引：确定要访问哪个「一级间接块」
+      // NADDR_PER_BLOCK=256（每个一级间接块存储256个数据块地址）
+      int level2_idx = bn / NADDR_PER_BLOCK;
+      // 计算一级间接块中的索引：确定要访问该一级间接块中的哪个「数据块」
+      int level1_idx = bn % NADDR_PER_BLOCK;
+
+      // 2.1 处理二级间接块本身（inode的addrs[NDIRECT+1]存储二级间接块地址，此处为第13个元素）
+      // 读取inode中存储的二级间接块地址，检查是否已分配
+      if ((addr = ip->addrs[NDIRECT + 1]) == 0)
+          // 未分配则创建新的二级间接块，并存入inode的addrs数组
+          ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev);
+
+      // 读取二级间接块到内存缓冲区
+      bp = bread(ip->dev, addr);
+      // 将二级间接块数据转为uint数组（数组元素即一级间接块的物理块号）
+      a = (uint *)bp->data;
+
+      // 2.2 处理目标一级间接块（二级间接块数组中对应的元素）
+      // 检查二级间接块中指定索引的一级间接块是否已分配
+      if ((addr = a[level2_idx]) == 0)
+      {
+          // 未分配则创建新的一级间接块，存入二级间接块的数组中
+          a[level2_idx] = addr = balloc(ip->dev);
+          // 记录修改到日志（二级间接块内容已变）
+          log_write(bp);
+      }
+
+      // 释放二级间接块的缓冲区（后续不再操作它）
+      brelse(bp);
+
+      // 2.3 处理目标数据块（通过一级间接块查找）
+      // 读取目标一级间接块到内存缓冲区
+      bp = bread(ip->dev, addr);
+      // 将一级间接块数据转为uint数组（数组元素即数据块的物理块号）
+      a = (uint *)bp->data;
+
+      // 检查一级间接块中指定索引的数据块是否已分配
+      if ((addr = a[level1_idx]) == 0)
+      {
+          // 未分配则创建新的数据块，存入一级间接块的数组中
+          a[level1_idx] = addr = balloc(ip->dev);
+          // 记录修改到日志（一级间接块内容已变）
+          log_write(bp);
+      }
+
+      // 释放一级间接块的缓冲区
+      brelse(bp);
+      // 返回最终找到/分配的数据块物理块号
+      return addr;
+  }
+
+  // 3. 异常处理：逻辑块号超出最大范围（超过65803块），触发panic
   panic("bmap: out of range");
 }
 
@@ -430,6 +488,28 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  struct buf *bp1;
+  uint *a1;
+  if(ip -> addrs[NDIRECT + 1]){
+      bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+      a = (uint *)bp->data;
+      for (i = 0; i < NADDR_PER_BLOCK; ++i){
+        if(a[i]){
+            bp1 = bread(ip->dev, a[i]);
+            a1 = (uint *)bp1->data;
+            for (j = 0; j < NADDR_PER_BLOCK; ++j){
+                if (a1[j])
+                    bfree(ip->dev, a1[j]);
+            }
+            brelse(bp1);
+            bfree(ip->dev, a[i]);
+        }
+      }
+      brelse(bp);
+      bfree(ip->dev, ip->addrs[NDIRECT + 1]);
+      ip->addrs[NDIRECT + 1] = 0;
   }
 
   ip->size = 0;

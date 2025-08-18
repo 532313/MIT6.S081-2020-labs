@@ -291,37 +291,79 @@ sys_open(void)
   struct file *f;
   struct inode *ip;
   int n;
-
+//读取用户传入的参数：路径字符串、打开模式
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
     return -1;
 
   begin_op();
-
+//如果打开模式包含O_CREATE创建文件
   if(omode & O_CREATE){
+    //在path路径创建一个普通文件
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
       end_op();
       return -1;
     }
-  } else {
-    if((ip = namei(path)) == 0){
+  } else {  //不创建文件，直接查找path对应的inode
+    if((ip = namei(path)) == 0){    //路径不存在，返回错误
       end_op();
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+    if(ip->type == T_DIR && omode != O_RDONLY){ //文件是目录且不是只读，返回错误
       iunlockput(ip);
       end_op();
       return -1;
     }
   }
-
+//若是设备文件，则验证设备号是否合法
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
     return -1;
   }
 
+  // 处理符号链接：当文件是符号链接，且打开模式未指定O_NOFOLLOW（需要跟随链接）
+  if (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW))
+  {
+      // 循环跟随符号链接，最多跟随MAX_SYMLINK_DEPTH次（防止循环链接导致无限递归）
+      for (int i = 0; i < MAX_SYMLINK_DEPTH; ++i)
+      {
+          // 从当前符号链接文件中读取目标路径（符号链接的内容就是目标路径）
+          // readi参数：inode指针、文件描述符(0)、目标缓冲区(path)、偏移量(0)、读取长度(MAXPATH)
+          // 若读取的字节数不等于MAXPATH，说明路径读取失败
+          if (readi(ip, 0, (uint64)path, 0, MAXPATH) != MAXPATH)
+          {
+              iunlockput(ip); // 解锁并释放当前inode
+              end_op();       // 结束文件系统原子操作
+              return -1;      // 返回错误
+          }
+
+          iunlockput(ip);   // 释放当前符号链接的inode（已读取路径，不再需要）
+          ip = namei(path); // 解析新读取的目标路径，获取目标文件的inode
+
+          if (ip == 0)
+          {              // 若路径解析失败（目标不存在）
+              end_op();  // 结束操作
+              return -1; // 返回错误
+          }
+
+          ilock(ip); // 锁定新获取的inode（防止并发修改）
+
+          if (ip->type != T_SYMLINK) // 若新inode不是符号链接，说明已找到最终目标
+              break;                 // 跳出循环，停止跟随
+      }
+
+      // 循环结束后仍为符号链接 → 超过最大跟随深度（可能存在循环链接）
+      if (ip->type == T_SYMLINK)
+      {
+          iunlockput(ip); // 释放资源
+          end_op();
+          return -1; // 返回错误
+      }
+  }
+
+//分配文件结构体和fd
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
@@ -329,7 +371,7 @@ sys_open(void)
     end_op();
     return -1;
   }
-
+//根据inode类型初始化文件结构体
   if(ip->type == T_DEVICE){
     f->type = FD_DEVICE;
     f->major = ip->major;
@@ -483,4 +525,30 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64
+sys_symlink(void){
+    char target[MAXPATH], path[MAXPATH];
+    struct inode *ip_path;
+
+    if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+        return -1;
+    }
+
+    begin_op();
+    ip_path = create(path, T_SYMLINK, 0, 0);
+    if(ip_path == 0){
+        end_op();
+        return -1;
+    }
+    if(writei(ip_path, 0, (uint64)target, 0, MAXPATH) < MAXPATH){
+        iunlockput(ip_path);
+        end_op();
+        return -1;
+    }
+    iunlockput(ip_path);
+    end_op();
+    
+    return 0;
 }
